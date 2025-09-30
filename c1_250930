@@ -1,0 +1,310 @@
+import re
+import math
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+from enum import Enum
+
+class GerberCommand(Enum):
+    MOVE = 'M02'
+    LINEAR_INTERPOLATE = 'G01'
+    CLOCKWISE_ARC = 'G02'
+    COUNTERCLOCKWISE_ARC = 'G03'
+    APERTURE_SELECT = 'D'
+    FLASH = 'D03'
+
+"""
+Class Point:
+    def __init__(self, x: float, y: float):
+        self.x = x
+        self.y = y
+    #method 정의 : 
+    def distance_to(self, other: 'Point') -> float:실수형태로 반환
+        return math.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
+    #예시 p1 = Point(0,0), p2 = Point(3,4), p1.distance_to(p2) -> 5.0
+"""
+
+@dataclass
+class Point:
+    x: float
+    y: float
+    
+    def distance_to(self, other: 'Point') -> float:
+        return math.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
+
+@dataclass
+class Aperture:
+    code: int
+    shape: str  # str은 문자열, 'C' for circle, 'R' for rectangle, 'O' for obround
+    size_x: float
+    size_y: Optional[float] = None # Optional은 값이 있을수도 있고 없을 수도 있음, 곧 floatd 이거나 None
+    hole_diameter: Optional[float] = None
+
+class GerberParser:
+    def __init__(self):
+        self.apertures: Dict[int, Aperture] = {} # 딕셔너리, 키는 정수, 값은 aperture
+        self.current_aperture: Optional[int] = None
+        self.current_pos = Point(0, 0)
+        self.unit_factor = 1.0  # mm 기준
+        self.paths: List[List[Point]] = [] #예시 [[Point(0,0)],[Point(5,5)]]
+        self.flashes: List[Tuple[Point, int]] = []  #변경불가능한 순서쌍 (Point(10,20),15)
+    
+    #gerber파일로 인풋할때    
+    def parse_file(self, filename: str) -> None:
+        """Gerber 파일을 파싱합니다."""
+        with open(filename, 'r', encoding='utf-8') as file: #with써야 닫음
+            content = file.read()
+        
+        self._parse_content(content)
+    
+    #그냥 통 내용을 input할때
+    def parse_content(self, content: str) -> None:
+        """Gerber 파일 내용을 파싱합니다."""
+        self._parse_content(content)
+    
+    def _parse_content(self, content: str) -> None:
+        """내부 파싱 로직"""
+        lines = content.split('\n')
+        current_path = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('%'):
+                # 파라미터 블록 처리
+                if line.startswith('%ADD'):
+                    self._parse_aperture_definition(line)
+                elif 'MOMM*' in line:
+                    self.unit_factor = 1.0  # mm
+                elif 'MOIN*' in line:
+                    self.unit_factor = 25.4  # inch to mm
+                continue
+            
+            # 좌표와 명령 파싱
+            self._parse_command(line, current_path)
+    
+    def _parse_aperture_definition(self, line: str) -> None:
+        """애퍼처 정의를 파싱합니다."""
+        # 예: %ADD10C,0.152400*% / (\d+) 숫자한개이상, ([CRO]) CRO중하나, (?:)추출안함, ? 0개또는 한개
+        match = re.match(r'%ADD(\d+)([CRO]),([\d.]+)(?:X([\d.]+))?(?:X([\d.]+))?', line)
+        if match:
+            code = int(match.group(1))
+            shape = match.group(2)
+            size_x = float(match.group(3)) * self.unit_factor
+            size_y = float(match.group(4)) * self.unit_factor if match.group(4) else None
+            hole = float(match.group(5)) * self.unit_factor if match.group(5) else None
+            
+            self.apertures[code] = Aperture(code, shape, size_x, size_y, hole)
+    
+    def _parse_command(self, line: str, current_path: List[Point]) -> None:
+        """Gerber 명령을 파싱합니다."""
+        # 좌표 추출
+        x_match = re.search(r'X([-]?\d+)', line) #match는 시작부분만확인, search는 전체에서 찾음
+        y_match = re.search(r'Y([-]?\d+)', line) #Y'-'는 있을수도 없을수도, 숫자한개이상
+        
+        if x_match or y_match:
+            # 좌표 업데이트 (단위 변환 포함)
+            if x_match:
+                self.current_pos.x = int(x_match.group(1)) / 1000.0 * self.unit_factor
+            if y_match:
+                self.current_pos.y = int(y_match.group(1)) / 1000.0 * self.unit_factor
+        
+        # D코드 처리
+        d_match = re.search(r'D(\d+)', line)
+        if d_match:
+            d_code = int(d_match.group(1))
+            
+            if d_code >= 10:  # 애퍼처 선택
+                self.current_aperture = d_code
+                if current_path:
+                    self.paths.append(current_path.copy())
+                    current_path.clear()
+            elif d_code == 1:  # 라인 드로우
+                if self.current_aperture:
+                    current_path.append(Point(self.current_pos.x, self.current_pos.y))
+            elif d_code == 2:  # 이동 (펜 업)
+                if current_path:
+                    self.paths.append(current_path.copy())
+                    current_path.clear()
+            elif d_code == 3:  # 플래시
+                if self.current_aperture:
+                    self.flashes.append((Point(self.current_pos.x, self.current_pos.y), 
+                                      self.current_aperture))
+
+class CopperAreaCalculator:
+    def __init__(self, parser: GerberParser):
+        self.parser = parser
+    
+    def calculate_total_copper_area(self) -> float:
+        """전체 구리 면적을 계산합니다 (mm²)."""
+        path_area = self.calculate_path_area()
+        flash_area = self.calculate_flash_area()
+        
+        return path_area + flash_area
+    
+    def calculate_path_area(self) -> float:
+        """패스(트레이스) 면적을 계산합니다."""
+        total_area = 0.0
+        
+        for path in self.parser.paths:
+            if len(path) < 2:
+                continue
+            
+            # 패스의 길이 계산
+            path_length = 0.0
+            for i in range(len(path) - 1):
+                path_length += path[i].distance_to(path[i + 1])
+            
+            # 현재 애퍼처의 너비로 면적 계산
+            if self.parser.current_aperture in self.parser.apertures:
+                aperture = self.parser.apertures[self.parser.current_aperture]
+                if aperture.shape == 'C':  # 원형
+                    width = aperture.size_x
+                elif aperture.shape == 'R':  # 직사각형
+                    width = min(aperture.size_x, aperture.size_y or aperture.size_x)
+                else:
+                    width = aperture.size_x
+                
+                total_area += path_length * width
+        
+        return total_area
+    
+    def calculate_flash_area(self) -> float:
+        """플래시(패드) 면적을 계산합니다."""
+        total_area = 0.0
+        
+        for position, aperture_code in self.parser.flashes:
+            if aperture_code in self.parser.apertures:
+                aperture = self.parser.apertures[aperture_code]
+                area = self._calculate_aperture_area(aperture)
+                total_area += area
+        
+        return total_area
+    
+    def _calculate_aperture_area(self, aperture: Aperture) -> float:
+        """애퍼처의 면적을 계산합니다."""
+        if aperture.shape == 'C':  # 원형
+            radius = aperture.size_x / 2
+            area = math.pi * radius * radius
+            
+            # 홀이 있는 경우 빼기
+            if aperture.hole_diameter:
+                hole_radius = aperture.hole_diameter / 2
+                area -= math.pi * hole_radius * hole_radius
+        
+        elif aperture.shape == 'R':  # 직사각형
+            area = aperture.size_x * (aperture.size_y or aperture.size_x)
+            
+            # 홀이 있는 경우 빼기
+            if aperture.hole_diameter:
+                hole_radius = aperture.hole_diameter / 2
+                area -= math.pi * hole_radius * hole_radius
+        
+        elif aperture.shape == 'O':  # Obround (타원형)
+            width = aperture.size_x
+            height = aperture.size_y or aperture.size_x
+            
+            if width > height:
+                radius = height / 2
+                area = math.pi * radius * radius + (width - height) * height
+            else:
+                radius = width / 2
+                area = math.pi * radius * radius + (height - width) * width
+            
+            # 홀이 있는 경우 빼기
+            if aperture.hole_diameter:
+                hole_radius = aperture.hole_diameter / 2
+                area -= math.pi * hole_radius * hole_radius
+        
+        else:
+            area = 0.0
+        
+        return max(0.0, area)
+    
+    def get_detailed_report(self) -> Dict[str, float]:
+        """상세한 구리 면적 분석 리포트를 반환합니다."""
+        path_area = self.calculate_path_area()
+        flash_area = self.calculate_flash_area()
+        total_area = path_area + flash_area
+        
+        # 애퍼처별 분석
+        aperture_analysis = {}
+        for code, aperture in self.parser.apertures.items():
+            aperture_area = self._calculate_aperture_area(aperture)
+            flash_count = sum(1 for _, ac in self.parser.flashes if ac == code)
+            aperture_analysis[f"Aperture_{code}"] = {
+                'shape': aperture.shape,
+                'size_x': aperture.size_x,
+                'size_y': aperture.size_y,
+                'individual_area': aperture_area,
+                'flash_count': flash_count,
+                'total_contribution': aperture_area * flash_count
+            }
+        
+        return {
+            'total_copper_area_mm2': total_area,
+            'path_area_mm2': path_area,
+            'flash_area_mm2': flash_area,
+            'total_paths': len(self.parser.paths),
+            'total_flashes': len(self.parser.flashes),
+            'total_apertures': len(self.parser.apertures),
+            'aperture_details': aperture_analysis
+        }
+
+def main():
+    """사용 예제"""
+    # Gerber 파일 파싱
+    parser = GerberParser()
+    
+    try:
+        # 파일에서 읽기
+        parser.parse_file('example.gbr')
+        
+        # 또는 문자열에서 직접 파싱
+        # gerber_content = """
+        # %FSLAX25Y25*%
+        # %MOMM*%
+        # %ADD10C,0.152400*%
+        # %ADD11R,0.508000X0.508000*%
+        # G04 Start of data*
+        # D10*
+        # X0Y0D02*
+        # X1000000Y0D01*
+        # X1000000Y1000000D01*
+        # X0Y1000000D01*
+        # X0Y0D01*
+        # D11*
+        # X500000Y500000D03*
+        # M02*
+        # """
+        # parser.parse_content(gerber_content)
+        
+        # 구리 면적 계산
+        calculator = CopperAreaCalculator(parser)
+        
+        # 간단한 총 면적
+        total_area = calculator.calculate_total_copper_area()
+        print(f"총 구리 면적: {total_area:.4f} mm²")
+        
+        # 상세 리포트
+        report = calculator.get_detailed_report()
+        print("\n=== 상세 분석 리포트 ===")
+        print(f"총 구리 면적: {report['total_copper_area_mm2']:.4f} mm²")
+        print(f"패스 면적: {report['path_area_mm2']:.4f} mm²")
+        print(f"플래시 면적: {report['flash_area_mm2']:.4f} mm²")
+        print(f"총 패스 수: {report['total_paths']}")
+        print(f"총 플래시 수: {report['total_flashes']}")
+        print(f"총 애퍼처 수: {report['total_apertures']}")
+        
+        print("\n=== 애퍼처별 분석 ===")
+        for aperture_name, details in report['aperture_details'].items():
+            print(f"{aperture_name}: {details['shape']} 형태, "
+                  f"크기: {details['size_x']:.3f}mm, "
+                  f"사용횟수: {details['flash_count']}, "
+                  f"기여면적: {details['total_contribution']:.4f}mm²")
+    
+    except FileNotFoundError:
+        print("Gerber 파일을 찾을 수 없습니다. 파일 경로를 확인해주세요.")
+    except Exception as e:
+        print(f"오류 발생: {e}")
+
+if __name__ == "__main__":
+    main()
